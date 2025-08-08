@@ -30,6 +30,7 @@ import uvicorn
 from document_intelligence import DocumentIntelligenceSystem
 from database import DatabaseManager, db_manager, init_database, close_database
 from conflict_detector import ConflictDetector
+from fast_cache import query_cache, document_cache
 from dotenv import load_dotenv
 
 # Setup logging
@@ -196,14 +197,34 @@ class ProductionDocumentIntelligenceSystem(DocumentIntelligenceSystem):
             }
     
     async def query_document_with_cache(self, question: str, document_id: str) -> Dict[str, Any]:
-        """Query document with intelligent caching."""
+        """Query document with ultra-fast intelligent caching."""
         start_time = time.time()
         
         try:
-            # Check cache first
+            # Check in-memory cache first (fastest)
+            mem_cached = await query_cache.get(question, document_id)
+            if mem_cached:
+                logger.info(f"⚡ In-memory cache hit for query on document {document_id}")
+                return {
+                    "success": True,
+                    "answer": mem_cached.get("answer", ""),
+                    "source_clauses": mem_cached.get("source_clauses", []),
+                    "confidence": mem_cached.get("confidence", 0.95),
+                    "cached": True,
+                    "processing_time_ms": int((time.time() - start_time) * 1000)
+                }
+            
+            # Check database cache second
             cached_result = await db_manager.get_cached_query(question, document_id)
             if cached_result:
-                logger.info(f"Cache hit for query on document {document_id}")
+                logger.info(f"💾 Database cache hit for query on document {document_id}")
+                
+                # Store in memory cache for next time
+                await query_cache.set(question, document_id, {
+                    "answer": cached_result.enhanced_answer or cached_result.standard_answer,
+                    "source_clauses": cached_result.source_clauses,
+                    "confidence": cached_result.confidence_level
+                })
                 
                 # Log cache hit analytics
                 await db_manager.log_analytics_event(
@@ -226,8 +247,8 @@ class ProductionDocumentIntelligenceSystem(DocumentIntelligenceSystem):
                     "processing_time_ms": int((time.time() - start_time) * 1000)
                 }
             
-            # Cache miss - perform enhanced query with conflict detection
-            result = await super().query_document_with_conflict_detection(question, top_k=10)
+            # Cache miss - perform enhanced query WITHOUT conflict detection for speed
+            result = await super().query_document(question, top_k=12)  # Direct query for speed
             
             if result["success"]:
                 processing_time = int((time.time() - start_time) * 1000)
@@ -249,7 +270,12 @@ class ProductionDocumentIntelligenceSystem(DocumentIntelligenceSystem):
                     }
                 }
                 
-                # Cache the result
+                # Cache the result in both memory and database
+                await query_cache.set(question, document_id, {
+                    "answer": result.get("answer", ""),
+                    "source_clauses": result.get("source_clauses", []),
+                    "confidence": result.get("confidence", 0.8)
+                })
                 await db_manager.cache_query_result(question, document_id, cache_data)
                 
                 # Log analytics
@@ -456,7 +482,7 @@ async def hackathon_endpoint(
                 return f"Error processing question: {str(e)}"
         
         # Create semaphore to limit concurrent processing for better performance
-        max_concurrent = min(5, len(request.questions))  # Limit concurrent requests to prevent overload
+        max_concurrent = min(8, len(request.questions))  # Increased concurrency for speed
         semaphore = asyncio.Semaphore(max_concurrent)
         
         async def process_with_semaphore(question: str, index: int) -> str:

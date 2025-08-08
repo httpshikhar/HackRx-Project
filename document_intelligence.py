@@ -358,7 +358,7 @@ class DocumentIntelligenceSystem:
                 "pdf_url": pdf_url
             }
     
-    async def query_document(self, question: str, top_k: int = 8) -> Dict[str, Any]:
+    async def query_document(self, question: str, top_k: int = 12) -> Dict[str, Any]:
         """
         Optimized query processing with improved accuracy and speed.
         
@@ -375,10 +375,10 @@ class DocumentIntelligenceSystem:
             # Generate embedding for the question
             question_embedding = await self._generate_embedding(question)
             
-            # Enhanced Pinecone search with better parameters
+            # Enhanced Pinecone search with better parameters for accuracy
             search_results = self.pinecone_index.query(
                 vector=question_embedding,
-                top_k=min(top_k * 2, 20),  # Get more results initially for better filtering
+                top_k=min(top_k * 3, 30),  # Get even more results for better accuracy
                 include_metadata=True
             )
             
@@ -390,15 +390,15 @@ class DocumentIntelligenceSystem:
                     "confidence": 0.0
                 }
             
-            # Filter and rank results by relevance and quality
+            # Filter and rank results by relevance - LOWER threshold for better recall
             filtered_matches = []
             for match in search_results.matches:
-                # Only include matches with reasonable similarity (threshold-based filtering)
-                if match.score >= 0.75:  # Adjust threshold based on your needs
+                # Much lower threshold to catch more relevant content
+                if match.score >= 0.70:  # Lower threshold for better recall
                     filtered_matches.append(match)
             
-            # If strict filtering leaves us with too few results, be more lenient
-            if len(filtered_matches) < 3:
+            # Always use at least top_k results for better accuracy
+            if len(filtered_matches) < top_k:
                 filtered_matches = search_results.matches[:top_k]
             else:
                 # Use the best filtered results
@@ -408,7 +408,7 @@ class DocumentIntelligenceSystem:
             source_clauses = []
             context_chunks = []
             total_context_length = 0
-            max_context_length = 4000  # Limit context to prevent token overflow
+            max_context_length = 6000  # Increased context for better accuracy
             
             for match in filtered_matches:
                 clause_text = match.metadata["text"]
