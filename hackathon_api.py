@@ -415,35 +415,50 @@ async def hackathon_endpoint(
         document_id = processing_result["document_id"]
         logger.info(f"✅ Document processed: {document_id} ({processing_result.get('chunks_processed', 0)} clauses)")
         
-        # Process all questions in parallel for efficiency
+        # Process all questions in parallel with optimized concurrency
         logger.info(f"🤔 Processing {len(request.questions)} questions in parallel...")
         
-        async def process_single_question(question: str) -> str:
-            """Process a single question and return the answer."""
+        async def process_single_question(question: str, question_index: int) -> str:
+            """Process a single question and return the answer with optimized parameters."""
             try:
+                # Use optimized query processing with better parameters
                 result = await production_system.query_document_with_cache(question, document_id)
                 if result["success"]:
+                    logger.info(f"✅ Q{question_index + 1} processed successfully")
                     return result["answer"]
                 else:
-                    logger.error(f"Question processing failed: {result.get('error')}")
+                    logger.error(f"❌ Q{question_index + 1} processing failed: {result.get('error')}")
                     return f"Error processing question: {result.get('error', 'Unknown error')}"
             except Exception as e:
-                logger.error(f"Exception in question processing: {e}")
+                logger.error(f"❌ Exception in Q{question_index + 1} processing: {e}")
                 return f"Error processing question: {str(e)}"
         
-        # Create tasks for parallel processing
-        question_tasks = [process_single_question(q) for q in request.questions]
+        # Create semaphore to limit concurrent processing for better performance
+        max_concurrent = min(5, len(request.questions))  # Limit concurrent requests to prevent overload
+        semaphore = asyncio.Semaphore(max_concurrent)
         
-        # Process questions with timeout protection
+        async def process_with_semaphore(question: str, index: int) -> str:
+            """Process question with concurrency control."""
+            async with semaphore:
+                return await process_single_question(question, index)
+        
+        # Create tasks for parallel processing with concurrency control
+        question_tasks = [
+            process_with_semaphore(q, i) for i, q in enumerate(request.questions)
+        ]
+        
+        # Process questions with optimized timeout
+        timeout = min(240, len(request.questions) * 30)  # Dynamic timeout based on question count
         try:
             answers = await asyncio.wait_for(
                 asyncio.gather(*question_tasks), 
-                timeout=300  # 5 minute timeout
+                timeout=timeout
             )
         except asyncio.TimeoutError:
+            logger.error(f"⏰ Request timeout after {timeout}s")
             raise HTTPException(
                 status_code=408, 
-                detail="Request timeout - questions took too long to process"
+                detail=f"Request timeout - questions took longer than {timeout} seconds to process"
             )
         
         # Calculate metrics

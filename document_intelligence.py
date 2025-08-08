@@ -147,58 +147,83 @@ class DocumentIntelligenceSystem:
             logger.error(f"Failed to extract text from PDF: {e}")
             raise
     
-    def _chunk_text_into_clauses(self, text: str, max_chunk_size: int = 1000) -> List[str]:
+    def _chunk_text_into_clauses(self, text: str, max_chunk_size: int = 800) -> List[str]:
         """
-        Intelligently chunk text into meaningful clauses/paragraphs.
+        Intelligently chunk text into meaningful clauses/paragraphs with overlap for better accuracy.
         
         Args:
             text: The text to chunk
             max_chunk_size: Maximum size of each chunk
             
         Returns:
-            List of text chunks
+            List of text chunks with strategic overlap
         """
-        # Clean the text
+        # Clean and normalize the text
         text = re.sub(r'\s+', ' ', text.strip())
+        text = re.sub(r'\n+', '\n', text)  # Normalize line breaks
         
-        # Split by common clause/paragraph separators
+        # Enhanced clause/paragraph separators for better semantic chunking
         clause_separators = [
-            r'\n\n+',  # Double newlines (paragraphs)
-            r'\.\s+(?=[A-Z])',  # Sentence endings followed by capital letters
-            r';\s+',  # Semicolons
-            r':\s+(?=[A-Z])',  # Colons followed by capital letters
+            r'\n\n+',  # Double newlines (clear paragraph breaks)
+            r'\n(?=[A-Z][^a-z]*:)',  # Section headers (e.g., "SECTION:", "COVERAGE:")
+            r'\n(?=\d+\.\s)',  # Numbered lists
+            r'\n(?=[A-Z][^a-z]*\s[A-Z])',  # All caps section headers
+            r'\.\s+(?=[A-Z][a-z])',  # Sentence endings followed by capital letters
+            r';\s+(?=[A-Z])',  # Semicolons followed by capital letters
+            r':\s+(?=[A-Z][a-z])',  # Colons followed by capital letters (not headers)
         ]
         
         chunks = [text]
         
-        # Apply separators in order
+        # Apply separators in order of priority
         for separator in clause_separators:
             new_chunks = []
             for chunk in chunks:
-                split_chunks = re.split(separator, chunk)
-                new_chunks.extend([c.strip() for c in split_chunks if c.strip()])
+                if len(chunk) > max_chunk_size * 1.5:  # Only split if chunk is significantly large
+                    split_chunks = re.split(separator, chunk)
+                    new_chunks.extend([c.strip() for c in split_chunks if c.strip()])
+                else:
+                    new_chunks.append(chunk)
             chunks = new_chunks
         
-        # Merge small chunks and split large ones
+        # Smart merging with overlap for context preservation
         final_chunks = []
         current_chunk = ""
+        overlap_size = 100  # Characters to overlap between chunks
         
         for chunk in chunks:
-            # If adding this chunk exceeds max size and current chunk is not empty
+            # If adding this chunk exceeds max size
             if len(current_chunk + " " + chunk) > max_chunk_size and current_chunk:
                 final_chunks.append(current_chunk.strip())
-                current_chunk = chunk
+                
+                # Create overlap from the end of current chunk
+                words = current_chunk.split()
+                if len(words) > 10:  # Only overlap if there are enough words
+                    overlap = ' '.join(words[-10:])  # Last 10 words as context
+                    current_chunk = overlap + " " + chunk
+                else:
+                    current_chunk = chunk
             else:
                 current_chunk = (current_chunk + " " + chunk).strip()
         
-        # Add the last chunk if it exists
+        # Add the last chunk
         if current_chunk:
             final_chunks.append(current_chunk)
         
-        # Filter out very short chunks (less than 50 characters)
-        final_chunks = [chunk for chunk in final_chunks if len(chunk) >= 50]
+        # Enhanced filtering: remove very short chunks and duplicates
+        filtered_chunks = []
+        seen_chunks = set()
         
-        return final_chunks
+        for chunk in final_chunks:
+            chunk = chunk.strip()
+            if len(chunk) >= 100:  # Increased minimum size for better context
+                # Simple deduplication based on first 50 characters
+                chunk_key = chunk[:50].lower()
+                if chunk_key not in seen_chunks:
+                    filtered_chunks.append(chunk)
+                    seen_chunks.add(chunk_key)
+        
+        return filtered_chunks
     
     async def _generate_embedding(self, text: str) -> List[float]:
         """Generate embedding for text using Azure OpenAI."""
@@ -210,6 +235,35 @@ class DocumentIntelligenceSystem:
             return response.data[0].embedding
         except Exception as e:
             logger.error(f"Failed to generate embedding: {e}")
+            raise
+    
+    async def _generate_embeddings_batch(self, texts: List[str], batch_size: int = 16) -> List[List[float]]:
+        """Generate embeddings for multiple texts in batches for better performance."""
+        try:
+            all_embeddings = []
+            
+            for i in range(0, len(texts), batch_size):
+                batch = texts[i:i + batch_size]
+                
+                # Generate embeddings for batch
+                response = self.azure_client_embeddings.embeddings.create(
+                    input=batch,
+                    model=self.embedding_model
+                )
+                
+                # Extract embeddings from response
+                batch_embeddings = [data.embedding for data in response.data]
+                all_embeddings.extend(batch_embeddings)
+                
+                # Small delay to prevent API rate limiting
+                if i > 0 and i % (batch_size * 3) == 0:
+                    await asyncio.sleep(0.1)
+            
+            logger.info(f"Generated {len(all_embeddings)} embeddings in batches")
+            return all_embeddings
+            
+        except Exception as e:
+            logger.error(f"Failed to generate batch embeddings: {e}")
             raise
     
     def _generate_document_id(self, pdf_url: str) -> str:
@@ -243,12 +297,14 @@ class DocumentIntelligenceSystem:
             chunks = self._chunk_text_into_clauses(text)
             logger.info(f"Created {len(chunks)} chunks from document")
             
-            # Generate embeddings for all chunks
+            # Generate embeddings for all chunks using batch processing for better performance
+            logger.info(f"Generating embeddings for {len(chunks)} chunks using batch processing...")
+            embeddings = await self._generate_embeddings_batch(chunks)
+            
             vectors_to_upsert = []
             clauses_data = []  # For database storage
             
-            for i, chunk in enumerate(chunks):
-                embedding = await self._generate_embedding(chunk)
+            for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
                 vector_id = f"{doc_id}_chunk_{i}"
                 
                 vector_data = {
@@ -302,13 +358,13 @@ class DocumentIntelligenceSystem:
                 "pdf_url": pdf_url
             }
     
-    async def query_document(self, question: str, top_k: int = 5) -> Dict[str, Any]:
+    async def query_document(self, question: str, top_k: int = 8) -> Dict[str, Any]:
         """
-        Query the document database and generate an answer using retrieved clauses.
+        Optimized query processing with improved accuracy and speed.
         
         Args:
             question: The question to ask
-            top_k: Number of top relevant clauses to retrieve
+            top_k: Number of top relevant clauses to retrieve (increased default for better accuracy)
             
         Returns:
             Dictionary with answer and source clauses
@@ -319,10 +375,10 @@ class DocumentIntelligenceSystem:
             # Generate embedding for the question
             question_embedding = await self._generate_embedding(question)
             
-            # Search in Pinecone
+            # Enhanced Pinecone search with better parameters
             search_results = self.pinecone_index.query(
                 vector=question_embedding,
-                top_k=top_k,
+                top_k=min(top_k * 2, 20),  # Get more results initially for better filtering
                 include_metadata=True
             )
             
@@ -334,31 +390,63 @@ class DocumentIntelligenceSystem:
                     "confidence": 0.0
                 }
             
-            # Extract relevant clauses
-            source_clauses = []
-            context_text = ""
-            
+            # Filter and rank results by relevance and quality
+            filtered_matches = []
             for match in search_results.matches:
+                # Only include matches with reasonable similarity (threshold-based filtering)
+                if match.score >= 0.75:  # Adjust threshold based on your needs
+                    filtered_matches.append(match)
+            
+            # If strict filtering leaves us with too few results, be more lenient
+            if len(filtered_matches) < 3:
+                filtered_matches = search_results.matches[:top_k]
+            else:
+                # Use the best filtered results
+                filtered_matches = filtered_matches[:top_k]
+            
+            # Extract relevant clauses with enhanced context preparation
+            source_clauses = []
+            context_chunks = []
+            total_context_length = 0
+            max_context_length = 4000  # Limit context to prevent token overflow
+            
+            for match in filtered_matches:
+                clause_text = match.metadata["text"]
+                
+                # Skip if adding this would exceed our context limit
+                if total_context_length + len(clause_text) > max_context_length:
+                    break
+                
                 clause_info = {
-                    "text": match.metadata["text"],
+                    "text": clause_text,
                     "document_url": match.metadata["document_url"],
                     "chunk_index": match.metadata["chunk_index"],
                     "similarity_score": float(match.score)
                 }
                 source_clauses.append(clause_info)
-                context_text += f"\n\n{match.metadata['text']}"
+                context_chunks.append(f"[Clause {len(context_chunks) + 1}]\n{clause_text}")
+                total_context_length += len(clause_text)
             
-            # Generate answer using Azure OpenAI Chat Completion
-            answer = await self._generate_answer(question, context_text)
+            # Create well-structured context
+            context_text = "\n\n".join(context_chunks)
             
-            # Calculate average confidence score
-            avg_confidence = sum(clause["similarity_score"] for clause in source_clauses) / len(source_clauses)
+            # Generate answer using optimized prompt
+            answer = await self._generate_answer_optimized(question, context_text, source_clauses)
+            
+            # Calculate weighted confidence score (gives more weight to higher-scoring matches)
+            if source_clauses:
+                weighted_confidence = sum(
+                    clause["similarity_score"] * (1.0 / (i + 1))  # Higher weight for earlier (more relevant) matches
+                    for i, clause in enumerate(source_clauses)
+                ) / len(source_clauses)
+            else:
+                weighted_confidence = 0.0
             
             return {
                 "success": True,
                 "answer": answer,
                 "source_clauses": source_clauses,
-                "confidence": avg_confidence,
+                "confidence": weighted_confidence,
                 "total_clauses_found": len(source_clauses)
             }
             
@@ -399,6 +487,85 @@ Please provide a comprehensive answer based on the context provided above."""
         except Exception as e:
             logger.error(f"Failed to generate answer: {e}")
             return f"Error generating answer: {str(e)}"
+    
+    async def _generate_answer_optimized(self, question: str, context: str, source_clauses: List[Dict]) -> str:
+        """Generate an optimized answer with better prompt engineering for hackathon accuracy."""
+        try:
+            # Analyze question type to tailor the prompt
+            question_lower = question.lower()
+            is_specific_value = any(word in question_lower for word in ['how much', 'how many', 'what is the', 'amount', 'cost', 'price', 'coverage'])
+            is_list_question = any(word in question_lower for word in ['what are', 'list', 'benefits', 'features', 'types'])
+            is_definition = any(word in question_lower for word in ['what does', 'define', 'meaning', 'explain'])
+            
+            # Create specialized system prompt based on question type
+            if is_specific_value:
+                system_prompt = """You are a precise document analyst. Extract specific values, amounts, and factual information from the provided context. 
+                Be exact and concise. If you find a specific number, amount, or value, state it clearly. 
+                If the exact information isn't available, say so explicitly rather than guessing."""
+            elif is_list_question:
+                system_prompt = """You are a document analyst focused on extracting comprehensive lists and enumerations. 
+                When asked for lists, provide complete, organized information from the context. 
+                Use bullet points or numbered lists when appropriate for clarity."""
+            elif is_definition:
+                system_prompt = """You are a document analyst specializing in definitions and explanations. 
+                Provide clear, accurate definitions based on the context. 
+                Quote directly from the source when possible for maximum accuracy."""
+            else:
+                system_prompt = """You are a highly accurate document analysis assistant specialized in insurance and policy documents. 
+                Provide precise, factual answers based solely on the provided context. 
+                When uncertain, acknowledge limitations rather than speculating."""
+            
+            # Enhanced user prompt with structure
+            user_prompt = f"""DOCUMENT CONTEXT:
+{context}
+
+QUESTION: {question}
+
+INSTRUCTIONS:
+1. Answer based ONLY on the provided context
+2. Be specific and precise
+3. If the context contains exact values, amounts, or lists, include them
+4. If information is not available in the context, state "This information is not available in the provided context"
+5. Keep your answer focused and direct
+
+ANSWER:"""
+            
+            # Optimized parameters for better accuracy
+            response = self.azure_client_chat.chat.completions.create(
+                model=self.chat_model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt}
+                ],
+                max_completion_tokens=800,  # Shorter for more focused answers
+                temperature=0.1,  # Lower temperature for more consistent answers
+                top_p=0.9  # Focused sampling
+            )
+            
+            answer = response.choices[0].message.content
+            
+            # Post-process answer to improve accuracy
+            answer = answer.strip()
+            
+            # Remove common AI assistant prefixes that might reduce accuracy scores
+            prefixes_to_remove = [
+                "Based on the provided context, ",
+                "According to the document, ",
+                "From the context provided, ",
+                "The document states that "
+            ]
+            
+            for prefix in prefixes_to_remove:
+                if answer.startswith(prefix):
+                    answer = answer[len(prefix):]
+                    break
+            
+            return answer
+            
+        except Exception as e:
+            logger.error(f"Failed to generate optimized answer: {e}")
+            # Fallback to basic answer generation
+            return await self._generate_answer(question, context)
     
     async def query_document_with_conflict_detection(self, question: str, top_k: int = 10) -> Dict[str, Any]:
         """
