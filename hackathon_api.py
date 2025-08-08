@@ -5,7 +5,7 @@ EXACT HACKATHON COMPLIANCE:
 - Endpoint: POST /hackrx/run
 - Request: {"documents": "blob_url", "questions": ["q1", "q2", ...]}
 - Response: {"answers": ["answer1", "answer2", ...]}
-- Bearer token authentication
+- No authentication required
 - Async processing with PostgreSQL integration
 - Advanced o3-mini conflict detection
 """
@@ -20,8 +20,7 @@ from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, HTTPException, Depends, Request, BackgroundTasks
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi import FastAPI, HTTPException, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, validator
@@ -42,9 +41,6 @@ logger = logging.getLogger(__name__)
 
 # Load environment variables
 load_dotenv()
-
-# Security
-security = HTTPBearer()
 
 # Pydantic models for exact hackathon compliance
 class HackathonRequest(BaseModel):
@@ -362,33 +358,11 @@ app.add_middleware(
 )
 
 
-# Authentication
-def verify_bearer_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
-    """Verify bearer token (implement your authentication logic here)."""
-    token = credentials.credentials
-    
-    # For hackathon - simple token validation
-    # In production, use proper JWT validation or API key management
-    expected_token = os.getenv("API_BEARER_TOKEN", "hackrx2024_default_token")
-    
-    if token != expected_token:
-        raise HTTPException(
-            status_code=401,
-            detail="Invalid authentication token",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
-    
-    return token
-
-
 def get_client_info(request: Request) -> Dict[str, Any]:
     """Extract client information for analytics."""
     return {
         "client_ip": request.client.host,
-        "user_agent": request.headers.get("user-agent"),
-        "bearer_token_hash": hashlib.md5(
-            request.headers.get("authorization", "").encode()
-        ).hexdigest()[:16] if request.headers.get("authorization") else None
+        "user_agent": request.headers.get("user-agent")
     }
 
 
@@ -397,8 +371,7 @@ def get_client_info(request: Request) -> Dict[str, Any]:
 async def hackathon_endpoint(
     request: HackathonRequest,
     background_tasks: BackgroundTasks,
-    http_request: Request,
-    token: str = Depends(verify_bearer_token)
+    http_request: Request
 ):
     """
     EXACT HACKATHON COMPLIANCE ENDPOINT
@@ -416,7 +389,6 @@ async def hackathon_endpoint(
         # Create API request log
         api_log_id = await db_manager.create_api_request_log({
             "request_id": request_id,
-            "bearer_token_hash": client_info["bearer_token_hash"],
             "client_ip": client_info["client_ip"],
             "user_agent": client_info["user_agent"],
             "document_url": request.documents,
@@ -544,7 +516,7 @@ async def health_check():
 
 # SYSTEM STATUS ENDPOINT
 @app.get("/status")
-async def system_status(token: str = Depends(verify_bearer_token)):
+async def system_status():
     """Detailed system status for monitoring."""
     try:
         stats = await db_manager.get_system_stats()
@@ -571,7 +543,7 @@ async def system_status(token: str = Depends(verify_bearer_token)):
 
 # CACHE MANAGEMENT ENDPOINT
 @app.post("/admin/cache/clean")
-async def clean_cache(token: str = Depends(verify_bearer_token)):
+async def clean_cache():
     """Clean expired cache entries."""
     try:
         cleaned = await db_manager.cleanup_expired_cache()
