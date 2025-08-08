@@ -293,48 +293,61 @@ class ProductionDocumentIntelligenceSystem(DocumentIntelligenceSystem):
             }
 
 
-# Global system instance
+# Global system instance and readiness signaling
 production_system: Optional[ProductionDocumentIntelligenceSystem] = None
+APP_READY: asyncio.Event = asyncio.Event()
+
+
+async def _initialize_system_background():
+    """Initialize heavy dependencies in the background to avoid startup timeouts (e.g., on Render)."""
+    global production_system
+    try:
+        logger.info("⏳ Background initialization started...")
+        # Initialize database connection pool
+        await init_database()
+        logger.info("✅ Database connection pool initialized")
+        
+        # Initialize production system (sets up AI clients, Pinecone, etc.)
+        production_system = ProductionDocumentIntelligenceSystem()
+        logger.info("✅ Production system initialized")
+        
+        # Clean up expired cache
+        try:
+            cleaned = await db_manager.cleanup_expired_cache()
+            if cleaned > 0:
+                logger.info(f"🧹 Cleaned up {cleaned} expired cache entries")
+        except Exception as ce:
+            logger.warning(f"Cache cleanup skipped/failed: {ce}")
+        
+        # Mark app as ready
+        APP_READY.set()
+        logger.info("🚀 Background initialization complete. App is ready.")
+    except Exception as e:
+        logger.error(f"❌ Background initialization failed: {e}")
+        # Still set ready to avoid liveness loops, but endpoints will guard on None production_system
+        APP_READY.set()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Manage application lifespan - startup and shutdown."""
-    # Startup
-    logger.info("Starting Enhanced Document Intelligence API...")
-    
+    """Manage application lifespan - startup and shutdown. Avoid blocking startup."""
+    # Startup - DO NOT await heavy initialization here to prevent Render timeouts
+    logger.info("Starting Enhanced Document Intelligence API (non-blocking startup)...")
     try:
-        # Initialize database
-        await init_database()
-        logger.info("✅ Database connection pool initialized")
-        
-        # Initialize production system
-        global production_system
-        production_system = ProductionDocumentIntelligenceSystem()
-        logger.info("✅ Production system initialized")
-        
-        # Clean up expired cache on startup
-        cleaned = await db_manager.cleanup_expired_cache()
-        if cleaned > 0:
-            logger.info(f"✅ Cleaned up {cleaned} expired cache entries")
-        
-        logger.info("🚀 API ready for requests")
-        
+        # Fire-and-forget background initialization
+        asyncio.create_task(_initialize_system_background())
     except Exception as e:
-        logger.error(f"❌ Failed to initialize API: {e}")
-        raise
+        logger.error(f"Failed to schedule background initialization: {e}")
     
     yield
     
     # Shutdown
     logger.info("Shutting down Enhanced Document Intelligence API...")
-    
     try:
         await close_database()
         logger.info("✅ Database connections closed")
     except Exception as e:
         logger.error(f"Error during shutdown: {e}")
-    
     logger.info("👋 API shutdown complete")
 
 
@@ -386,6 +399,15 @@ async def hackathon_endpoint(
     logger.info(f"🎯 Hackathon request {request_id}: {len(request.questions)} questions for {request.documents}")
     
     try:
+        # Ensure system is ready (wait briefly up to 5s)
+        try:
+            await asyncio.wait_for(APP_READY.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            return JSONResponse(status_code=503, content={"error": "Service warming up, please retry shortly."})
+        
+        if production_system is None:
+            return JSONResponse(status_code=503, content={"error": "Service not fully initialized yet. Please retry."})
+        
         # Create API request log
         api_log_id = await db_manager.create_api_request_log({
             "request_id": request_id,
@@ -510,14 +532,22 @@ async def hackathon_endpoint(
 @app.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check endpoint with system statistics."""
+    app_ready = APP_READY.is_set()
     try:
-        # Test database connection
-        stats = await db_manager.get_system_stats()
+        stats = None
+        db_ok = False
+        if app_ready:
+            # Test database connection only if ready
+            try:
+                stats = await db_manager.get_system_stats()
+                db_ok = True
+            except Exception as stats_err:
+                logger.warning(f"System stats unavailable: {stats_err}")
         
         return HealthResponse(
-            status="healthy",
+            status="healthy" if app_ready else "starting",
             timestamp=datetime.now().isoformat(),
-            database_connected=True,
+            database_connected=db_ok,
             system_stats=stats
         )
     except Exception as e:
