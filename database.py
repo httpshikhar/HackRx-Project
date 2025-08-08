@@ -168,9 +168,20 @@ class DatabaseManager:
             
         except Exception as e:
             logger.error(f"Failed to initialize database connection pool: {e}")
-            # In Railway, don't fail immediately - allow app to start
-            if os.getenv("ENVIRONMENT") == "production":
-                logger.warning("Database initialization failed in production, continuing without database")
+            # In cloud deployments, don't fail immediately - allow app to start
+            # Detect cloud environments by common indicators
+            is_cloud = (
+                os.getenv("ENVIRONMENT") == "production" or
+                os.getenv("RENDER") or  # Render
+                os.getenv("RAILWAY_PROJECT_ID") or  # Railway 
+                os.getenv("VERCEL") or  # Vercel
+                os.getenv("HEROKU_APP_NAME") or  # Heroku
+                "render.com" in self.database_url or
+                "railway.app" in self.database_url
+            )
+            
+            if is_cloud:
+                logger.warning("Database initialization failed in cloud deployment, continuing without database")
                 return
             raise
     
@@ -183,9 +194,20 @@ class DatabaseManager:
     @asynccontextmanager
     async def get_connection(self):
         """Get a database connection from the pool."""
+        # Check if we're in a cloud environment
+        is_cloud = (
+            os.getenv("ENVIRONMENT") == "production" or
+            os.getenv("RENDER") or  # Render
+            os.getenv("RAILWAY_PROJECT_ID") or  # Railway 
+            os.getenv("VERCEL") or  # Vercel
+            os.getenv("HEROKU_APP_NAME") or  # Heroku
+            "render.com" in (self.database_url or "") or
+            "railway.app" in (self.database_url or "")
+        )
+        
         if not self.pool:
-            if os.getenv("ENVIRONMENT") == "production":
-                # In production, log warning but don't fail
+            if is_cloud:
+                # In cloud environments, log warning but don't fail
                 logger.warning("Database pool not available, skipping database operation")
                 yield None
                 return
@@ -197,7 +219,7 @@ class DatabaseManager:
                 yield connection
         except Exception as e:
             logger.error(f"Database connection error: {e}")
-            if os.getenv("ENVIRONMENT") == "production":
+            if is_cloud:
                 yield None
             else:
                 raise
@@ -577,6 +599,10 @@ class DatabaseManager:
     async def log_analytics_event(self, event_type: str, **kwargs):
         """Log an analytics event."""
         async with self.get_connection() as conn:
+            if conn is None:  # Database not available
+                logger.warning(f"Database not available, skipping analytics event: {event_type}")
+                return
+                
             await conn.execute("""
                 INSERT INTO analytics (
                     event_type, document_id, session_id, user_id, query_text,
@@ -597,6 +623,10 @@ class DatabaseManager:
         request_id = str(uuid.uuid4())
         
         async with self.get_connection() as conn:
+            if conn is None:  # Database not available
+                logger.warning("Database not available, skipping API request log creation")
+                return request_id  # Return the ID as if we logged it
+                
             await conn.execute("""
                 INSERT INTO api_requests (
                     id, request_id, bearer_token_hash, client_ip, user_agent,
@@ -614,6 +644,10 @@ class DatabaseManager:
     async def update_api_request_log(self, request_id: str, update_data: Dict[str, Any]):
         """Update an API request log entry."""
         async with self.get_connection() as conn:
+            if conn is None:  # Database not available
+                logger.warning("Database not available, skipping API request log update")
+                return
+                
             await conn.execute("""
                 UPDATE api_requests SET
                     processing_status = $2,
