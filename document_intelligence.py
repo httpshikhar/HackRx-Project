@@ -87,11 +87,47 @@ class DocumentIntelligenceSystem:
                 with open(pdf_url, 'rb') as f:
                     return f.read()
             else:
+                # Convert Google Drive sharing URLs to direct download URLs
+                if 'drive.google.com' in pdf_url and '/file/d/' in pdf_url:
+                    # Extract file ID from sharing URL
+                    file_id = pdf_url.split('/file/d/')[1].split('/')[0]
+                    # Convert to direct download URL
+                    pdf_url = f"https://drive.google.com/uc?export=download&id={file_id}"
+                    logger.info(f"Converted Google Drive URL to direct download: {pdf_url}")
+                
                 # Download from URL
                 logger.info(f"Downloading PDF from URL: {pdf_url}")
-                response = requests.get(pdf_url, stream=True, timeout=30)
+                
+                # Set headers to avoid blocking
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
+                
+                response = requests.get(pdf_url, stream=True, timeout=30, headers=headers, allow_redirects=True)
                 response.raise_for_status()
-                return response.content
+                
+                # Check if the response is actually a PDF
+                content = response.content
+                if not content.startswith(b'%PDF'):
+                    # If it's not a PDF, it might be a HTML page (Google Drive confirmation)
+                    if b'Google Drive - Virus scan warning' in content or b'virus scan' in content.lower():
+                        logger.warning("Google Drive virus scan warning detected, trying to extract direct download link")
+                        # Try to find the actual download URL in the HTML
+                        content_str = content.decode('utf-8', errors='ignore')
+                        import re
+                        download_match = re.search(r'href="([^"]*uc\?export=download[^"]*)', content_str)
+                        if download_match:
+                            actual_url = download_match.group(1).replace('&amp;', '&')
+                            logger.info(f"Found actual download URL: {actual_url}")
+                            response = requests.get(actual_url, stream=True, timeout=30, headers=headers)
+                            response.raise_for_status()
+                            content = response.content
+                        else:
+                            raise Exception("Could not find direct download link in Google Drive response")
+                    else:
+                        raise Exception(f"Downloaded content is not a PDF. Content type: {response.headers.get('Content-Type', 'Unknown')}")
+                
+                return content
         except Exception as e:
             logger.error(f"Failed to get PDF from {pdf_url}: {e}")
             raise
